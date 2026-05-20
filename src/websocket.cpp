@@ -27,10 +27,11 @@
 static esp_websocket_client_handle_t s_client = NULL;
 static volatile bool s_connected = false;     // WebSocket connected
 static volatile bool s_session_ready = false; // session.updated received from server
-static volatile bool s_assistant_busy = false; // assistant is generating response
 static char *s_accum_buf = NULL;
 
-// Session config: server VAD, PCM16 in/out, short instructions
+// Session config: client-controlled turn detection (no server VAD), PCM16 in/out.
+// Wake word + local VAD decide when to send audio and when to commit/respond,
+// so that we never burn tokens on ambient audio outside an active turn.
 static const char k_session_update[] =
     "{\"type\":\"session.update\",\"session\":{"
     "\"type\":\"realtime\","
@@ -38,12 +39,8 @@ static const char k_session_update[] =
     "\"audio\":{"
     "\"input\":{"
     "\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},"
-    "\"turn_detection\":{"
-    "\"type\":\"server_vad\","
-    "\"threshold\":0.5,"
-    "\"prefix_padding_ms\":300,"
-    "\"silence_duration_ms\":500"
-    "}},"
+    "\"turn_detection\":null"
+    "},"
     "\"output\":{"
     "\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},"
     "\"voice\":\"alloy\""
@@ -51,40 +48,37 @@ static const char k_session_update[] =
     "}}}";
 
 static void process_message(const char *msg) {
-  // session.updated → session is ready, audio streaming can start
   if (strstr(msg, "\"session.updated\"")) {
     s_session_ready = true;
-    ESP_LOGI(LOG_TAG, "Session ready — starting audio stream");
+    ESP_LOGI(LOG_TAG, "Session ready — waiting for wake word \"%s\"",
+             WAKE_WORD_PHRASE);
     return;
   }
 
-  // Assistant is generating a response → pause mic sending to free WS lock
-  if (strstr(msg, "\"response.created\"")) {
-    s_assistant_busy = true;
-  } else if (strstr(msg, "\"response.done\"")) {
-    // Keep mic paused for a cool-down period to let DMA drain and avoid
-    // echoing the assistant's own audio back through the microphone.
-    vTaskDelay(pdMS_TO_TICKS(1200));
+  if (strstr(msg, "\"response.done\"")) {
+    // Cool-down lets the DAC drain so we don't echo the assistant's own audio
+    // back through the mic and re-trigger the wake word. Kept just above the
+    // 683 ms DMA output buffer to minimise the gap before next turn.
+    vTaskDelay(pdMS_TO_TICKS(700));
 
-    // Tell server to discard any audio it received during the cool-down
     static const char clear_buf[] =
         "{\"type\":\"input_audio_buffer.clear\"}";
     esp_websocket_client_send_text(s_client, clear_buf, strlen(clear_buf),
                                    pdMS_TO_TICKS(500));
 
-    s_assistant_busy = false;
+    ESP_LOGI(LOG_TAG, "Response done — back to idle (say \"%s\" to activate)",
+             WAKE_WORD_PHRASE);
+    oai_wakeword_set_state(ASSISTANT_IDLE_WAITING_WAKE);
   }
 
   // Log non-audio-delta events (keep audio path quiet)
   if (!strstr(msg, "response.output_audio.delta")) {
-    // Skip noisy events too
     if (!strstr(msg, "response.output_audio_transcript.delta")) {
       ESP_LOGI(LOG_TAG, "Server event: %.200s", msg);
     }
     return;
   }
 
-  // Find the "delta":"..." value without full JSON parse
   const char *tag = "\"delta\":\"";
   const char *p = strstr(msg, tag);
   if (!p) return;
@@ -136,16 +130,13 @@ static void ws_event_handler(void *arg, esp_event_base_t base,
       ESP_LOGW(LOG_TAG, "WebSocket disconnected");
       s_connected = false;
       s_session_ready = false;
-      s_assistant_busy = false;
       vTaskDelay(pdMS_TO_TICKS(300));
       esp_restart();
       break;
 
     case WEBSOCKET_EVENT_DATA:
-      // Only handle text frames
       if (d->op_code != 1 || !s_accum_buf) break;
 
-      // Accumulate into buffer (handles fragmented messages)
       if ((int)d->payload_offset + d->data_len <= ACCUM_BUF_SIZE) {
         memcpy(s_accum_buf + d->payload_offset, d->data_ptr, d->data_len);
 
@@ -172,10 +163,24 @@ static void ws_event_handler(void *arg, esp_event_base_t base,
 
 static StaticTask_t s_audio_task_buf;
 
+static void commit_and_request_response(void) {
+  static const char commit_msg[] =
+      "{\"type\":\"input_audio_buffer.commit\"}";
+  static const char response_create[] =
+      "{\"type\":\"response.create\"}";
+  esp_websocket_client_send_text(s_client, commit_msg, strlen(commit_msg),
+                                 pdMS_TO_TICKS(500));
+  esp_websocket_client_send_text(s_client, response_create,
+                                 strlen(response_create), pdMS_TO_TICKS(500));
+  ESP_LOGI(LOG_TAG, "Turn closed locally: commit + response.create sent");
+}
+
 static void audio_send_task(void *arg) {
   static int16_t  pcm[AUDIO_IN_SAMPLES];
   static uint8_t  b64[BASE64_OUT_SIZE + 1];
   static char     msg[AUDIO_MSG_MAX];
+
+  AssistantState last_state = oai_assistant_state();
 
   while (1) {
     if (!s_connected || !s_session_ready) {
@@ -183,45 +188,48 @@ static void audio_send_task(void *arg) {
       continue;
     }
 
-    // Skip sending mic audio while assistant is speaking — server VAD already
-    // detected end-of-turn and the WebSocket lock is held by the receive path.
-    if (s_assistant_busy) {
-      // Still need to drain the I2S DMA buffer so it doesn't overflow,
-      // but throw away the data.
-      static int16_t discard[AUDIO_IN_SAMPLES];
-      oai_audio_input(discard, AUDIO_IN_SAMPLES);
+    // Always read mic so the I2S DMA never overflows.
+    oai_audio_input(pcm, AUDIO_IN_SAMPLES);
+
+    // Feed wake-word / local VAD (may transition the state below).
+    oai_wakeword_feed_24khz(pcm, AUDIO_IN_SAMPLES);
+
+    AssistantState state = oai_assistant_state();
+
+    // STREAMING -> TTS_PLAYING transition closes the turn for the server.
+    if (last_state == ASSISTANT_STREAMING_TO_OPENAI &&
+        state == ASSISTANT_TTS_PLAYING) {
+      commit_and_request_response();
+    }
+    last_state = state;
+
+    if (state != ASSISTANT_STREAMING_TO_OPENAI) {
+      // Either waiting for "suku" or assistant is replying — don't burn tokens.
       continue;
     }
 
-    // Read 10ms of PCM16 from INMP441
-    oai_audio_input(pcm, AUDIO_IN_SAMPLES);
-
-    // Base64 encode
+    // Base64-encode 10 ms of PCM and send as input_audio_buffer.append
     size_t b64_len = 0;
     mbedtls_base64_encode(b64, sizeof(b64), &b64_len,
                           (const uint8_t *)pcm, AUDIO_IN_BYTES);
     b64[b64_len] = '\0';
 
-    // Build and send JSON event
     int msg_len = snprintf(msg, sizeof(msg),
                            "{\"type\":\"input_audio_buffer.append\",\"audio\":\"%s\"}",
                            (char *)b64);
     if (msg_len > 0 && msg_len < (int)sizeof(msg)) {
-      // 1s timeout — when server is sending audio back, lock can be held briefly
       esp_websocket_client_send_text(s_client, msg, msg_len, pdMS_TO_TICKS(1000));
     }
   }
 }
 
 void oai_websocket(void) {
-  // Allocate accumulation buffer from PSRAM
   s_accum_buf = (char *)heap_caps_malloc(ACCUM_BUF_SIZE + 1, MALLOC_CAP_SPIRAM);
   if (!s_accum_buf) {
     ESP_LOGE(LOG_TAG, "Failed to allocate WS accumulation buffer");
     esp_restart();
   }
 
-  // Build headers: Authorization + OpenAI-Beta (required for GA API)
   static char headers[256];
   snprintf(headers, sizeof(headers),
            "Authorization: Bearer %s\r\n",
@@ -239,13 +247,11 @@ void oai_websocket(void) {
   esp_websocket_register_events(s_client, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
   esp_websocket_client_start(s_client);
 
-  // Audio send task pinned to core 0, stack in PSRAM
   StackType_t *stack = (StackType_t *)heap_caps_malloc(
       8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
   xTaskCreateStaticPinnedToCore(audio_send_task, "audio_send", 8192,
                                 NULL, 5, stack, &s_audio_task_buf, 0);
 
-  // Keep main task alive — WebSocket client has its own internal task
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(5000));
     if (!esp_websocket_client_is_connected(s_client)) {

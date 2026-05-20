@@ -15,6 +15,7 @@ extern "C" void app_main(void) {
   ESP_ERROR_CHECK(ret);
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   oai_init_audio_capture();
+  oai_wakeword_init();
   oai_wifi();
   oai_websocket();
 }

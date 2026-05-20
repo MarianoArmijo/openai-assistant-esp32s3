@@ -4,6 +4,6 @@ if(IDF_TARGET STREQUAL linux)
     REQUIRES esp_event esp_log)
 else()
   idf_component_register(
-    SRCS "main.cpp" "wifi.cpp" "media.cpp" "websocket.cpp"
-    REQUIRES driver esp_wifi nvs_flash esp_psram esp_websocket_client json mbedtls)
+    SRCS "main.cpp" "wifi.cpp" "media.cpp" "websocket.cpp" "wake_word.cpp"
+    REQUIRES driver esp_wifi nvs_flash esp_psram esp_websocket_client json mbedtls esp-sr)
 endif()

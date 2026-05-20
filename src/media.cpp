@@ -17,7 +17,15 @@
 #define DMA_BUF_COUNT_OUT      16
 
 // Software gain applied on output (shift 0 = 1×, 1 = 2× / +6dB, 2 = 4× / +12dB)
-#define OUTPUT_GAIN_SHIFT      1  // ×2 (+6 dB)
+#define OUTPUT_GAIN_SHIFT      2  // ×2 (+6 dB)
+
+// INMP441 input gain: lower shift = more gain.
+// INMP441 outputs 24-bit MSB-aligned in 32-bit. Shift defines int16 mapping:
+//   16 → unity (very quiet)
+//   14 → +12 dB (good for close talk ~30-60 cm)
+//   12 → +24 dB (good for ~1.5 m, but noise floor is louder)
+//   10 → +36 dB (good for ~3 m, may clip on close shouting)
+#define INPUT_SHIFT            14
 
 // MAX98357A I2S amplifier — I2S_NUM_0 TX
 #define DAC_BCLK_PIN  15
@@ -93,14 +101,19 @@ void oai_init_audio_capture() {
 }
 
 // Read `samples` mono PCM16 samples from INMP441.
-// INMP441 outputs 18-bit audio MSB-aligned in 32-bit frames; shift down to 16-bit.
+// INMP441 outputs 24-bit MSB-aligned in 32-bit frames. We shift down to int16
+// range with INPUT_SHIFT (main "mic gain" knob) and saturate to avoid the
+// wrap-around distortion a plain cast would produce at loud peaks.
 void oai_audio_input(int16_t *buf, int samples) {
   static int32_t raw[DMA_FRAME_SAMPLES_IN];
   size_t bytes_read = 0;
   i2s_read(I2S_NUM_1, raw, samples * sizeof(int32_t), &bytes_read, portMAX_DELAY);
   int n = (int)(bytes_read / sizeof(int32_t));
   for (int i = 0; i < n; i++) {
-    buf[i] = (int16_t)(raw[i] >> 14);
+    int32_t y = raw[i] >> INPUT_SHIFT;
+    if (y > INT16_MAX) y = INT16_MAX;
+    else if (y < INT16_MIN) y = INT16_MIN;
+    buf[i] = (int16_t)y;
   }
 }
 
