@@ -1,144 +1,128 @@
 #include <driver/i2s.h>
-#include <opus.h>
+#include <string.h>
 
 #include "main.h"
 
-#define OPUS_OUT_BUFFER_SIZE 1276  // 1276 bytes is recommended by opus_encode
-#define SAMPLE_RATE 8000
-#define BUFFER_SAMPLES 320
+// INMP441 input: 24kHz (OpenAI Realtime API minimum), 32-bit frame (18-bit audio MSB-aligned)
+#define INPUT_SAMPLE_RATE  24000
+// MAX98357A output: 24kHz (matches OpenAI Realtime API PCM16 output)
+#define OUTPUT_SAMPLE_RATE 24000
 
-#define MCLK_PIN 0
-#define DAC_BCLK_PIN 15
+// I2S DMA buffer sizes:
+//  - Input: 10ms chunks (240 samples)
+//  - Output: larger chunks to absorb OpenAI's bursty audio.delta frames
+#define DMA_FRAME_SAMPLES_IN   240
+#define DMA_FRAME_SAMPLES_OUT  1024
+// 16 × 1024 × 2 bytes = 32 KB → ~683 ms playback buffer at 24 kHz
+#define DMA_BUF_COUNT_OUT      16
+
+// Software gain applied on output (shift 0 = 1×, 1 = 2× / +6dB, 2 = 4× / +12dB)
+#define OUTPUT_GAIN_SHIFT      1  // ×2 (+6 dB)
+
+// MAX98357A I2S amplifier — I2S_NUM_0 TX
+#define DAC_BCLK_PIN  15
 #define DAC_LRCLK_PIN 16
-#define DAC_DATA_PIN 17
-#define ADC_BCLK_PIN 38
-#define ADC_LRCLK_PIN 39
-#define ADC_DATA_PIN 40
+#define DAC_DATA_PIN   7
 
-#define OPUS_ENCODER_BITRATE 30000
-#define OPUS_ENCODER_COMPLEXITY 0
+// INMP441 I2S microphone — I2S_NUM_1 RX
+// L/R pin must be tied to GND (selects left channel)
+#define ADC_BCLK_PIN   5
+#define ADC_LRCLK_PIN  4
+#define ADC_DATA_PIN   6
 
 void oai_init_audio_capture() {
+  // MAX98357A: 24kHz, 16-bit mono, Philips standard I2S, no MCLK
   i2s_config_t i2s_config_out = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-      .sample_rate = SAMPLE_RATE,
+      .sample_rate = OUTPUT_SAMPLE_RATE,
       .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-      .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
       .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-      .dma_buf_count = 8,
-      .dma_buf_len = BUFFER_SAMPLES,
-      .use_apll = 1,
+      .dma_buf_count = DMA_BUF_COUNT_OUT,
+      .dma_buf_len = DMA_FRAME_SAMPLES_OUT,
+      .use_apll = 0,
       .tx_desc_auto_clear = true,
   };
   if (i2s_driver_install(I2S_NUM_0, &i2s_config_out, 0, NULL) != ESP_OK) {
-    printf("Failed to configure I2S driver for audio output");
+    printf("Failed to configure I2S driver for audio output\n");
     return;
   }
 
   i2s_pin_config_t pin_config_out = {
-      .mck_io_num = MCLK_PIN,
-      .bck_io_num = DAC_BCLK_PIN,
-      .ws_io_num = DAC_LRCLK_PIN,
+      .mck_io_num   = I2S_PIN_NO_CHANGE,
+      .bck_io_num   = DAC_BCLK_PIN,
+      .ws_io_num    = DAC_LRCLK_PIN,
       .data_out_num = DAC_DATA_PIN,
-      .data_in_num = I2S_PIN_NO_CHANGE,
+      .data_in_num  = I2S_PIN_NO_CHANGE,
   };
   if (i2s_set_pin(I2S_NUM_0, &pin_config_out) != ESP_OK) {
-    printf("Failed to set I2S pins for audio output");
+    printf("Failed to set I2S pins for audio output\n");
     return;
   }
   i2s_zero_dma_buffer(I2S_NUM_0);
 
+  // INMP441: 24kHz, 32-bit frame, Philips standard I2S, mono left channel
   i2s_config_t i2s_config_in = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-      .sample_rate = SAMPLE_RATE,
-      .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+      .sample_rate = INPUT_SAMPLE_RATE,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
       .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-      .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
       .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
       .dma_buf_count = 8,
-      .dma_buf_len = BUFFER_SAMPLES,
-      .use_apll = 1,
+      .dma_buf_len = DMA_FRAME_SAMPLES_IN,
+      .use_apll = 0,
   };
   if (i2s_driver_install(I2S_NUM_1, &i2s_config_in, 0, NULL) != ESP_OK) {
-    printf("Failed to configure I2S driver for audio input");
+    printf("Failed to configure I2S driver for audio input\n");
     return;
   }
 
   i2s_pin_config_t pin_config_in = {
-      .mck_io_num = MCLK_PIN,
-      .bck_io_num = ADC_BCLK_PIN,
-      .ws_io_num = ADC_LRCLK_PIN,
+      .mck_io_num   = I2S_PIN_NO_CHANGE,
+      .bck_io_num   = ADC_BCLK_PIN,
+      .ws_io_num    = ADC_LRCLK_PIN,
       .data_out_num = I2S_PIN_NO_CHANGE,
-      .data_in_num = ADC_DATA_PIN,
+      .data_in_num  = ADC_DATA_PIN,
   };
   if (i2s_set_pin(I2S_NUM_1, &pin_config_in) != ESP_OK) {
-    printf("Failed to set I2S pins for audio input");
+    printf("Failed to set I2S pins for audio input\n");
     return;
   }
 }
 
-opus_int16 *output_buffer = NULL;
-OpusDecoder *opus_decoder = NULL;
-
-void oai_init_audio_decoder() {
-  int decoder_error = 0;
-  opus_decoder = opus_decoder_create(SAMPLE_RATE, 2, &decoder_error);
-  if (decoder_error != OPUS_OK) {
-    printf("Failed to create OPUS decoder");
-    return;
-  }
-
-  output_buffer = (opus_int16 *)malloc(BUFFER_SAMPLES * sizeof(opus_int16));
-}
-
-void oai_audio_decode(uint8_t *data, size_t size) {
-  int decoded_size =
-      opus_decode(opus_decoder, data, size, output_buffer, BUFFER_SAMPLES, 0);
-
-  if (decoded_size > 0) {
-    size_t bytes_written = 0;
-    i2s_write(I2S_NUM_0, output_buffer, BUFFER_SAMPLES * sizeof(opus_int16),
-              &bytes_written, portMAX_DELAY);
-  }
-}
-
-OpusEncoder *opus_encoder = NULL;
-opus_int16 *encoder_input_buffer = NULL;
-uint8_t *encoder_output_buffer = NULL;
-
-void oai_init_audio_encoder() {
-  int encoder_error;
-  opus_encoder = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP,
-                                     &encoder_error);
-  if (encoder_error != OPUS_OK) {
-    printf("Failed to create OPUS encoder");
-    return;
-  }
-
-  if (opus_encoder_init(opus_encoder, SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP) !=
-      OPUS_OK) {
-    printf("Failed to initialize OPUS encoder");
-    return;
-  }
-
-  opus_encoder_ctl(opus_encoder, OPUS_SET_BITRATE(OPUS_ENCODER_BITRATE));
-  opus_encoder_ctl(opus_encoder, OPUS_SET_COMPLEXITY(OPUS_ENCODER_COMPLEXITY));
-  opus_encoder_ctl(opus_encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
-  encoder_input_buffer = (opus_int16 *)malloc(BUFFER_SAMPLES);
-  encoder_output_buffer = (uint8_t *)malloc(OPUS_OUT_BUFFER_SIZE);
-}
-
-void oai_send_audio(PeerConnection *peer_connection) {
+// Read `samples` mono PCM16 samples from INMP441.
+// INMP441 outputs 18-bit audio MSB-aligned in 32-bit frames; shift down to 16-bit.
+void oai_audio_input(int16_t *buf, int samples) {
+  static int32_t raw[DMA_FRAME_SAMPLES_IN];
   size_t bytes_read = 0;
+  i2s_read(I2S_NUM_1, raw, samples * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+  int n = (int)(bytes_read / sizeof(int32_t));
+  for (int i = 0; i < n; i++) {
+    buf[i] = (int16_t)(raw[i] >> 14);
+  }
+}
 
-  i2s_read(I2S_NUM_1, encoder_input_buffer, BUFFER_SAMPLES, &bytes_read,
-           portMAX_DELAY);
+// Write `samples` mono PCM16 samples to MAX98357A, with software gain.
+void oai_audio_output(const int16_t *buf, int samples) {
+  // Apply gain with hard clipping to avoid wrap-around distortion
+  static int16_t boosted[2048];
+  int chunk_max = (int)(sizeof(boosted) / sizeof(int16_t));
 
-  auto encoded_size =
-      opus_encode(opus_encoder, encoder_input_buffer, BUFFER_SAMPLES / 2,
-                  encoder_output_buffer, OPUS_OUT_BUFFER_SIZE);
-
-  peer_connection_send_audio(peer_connection, encoder_output_buffer,
-                             encoded_size);
+  int remaining = samples;
+  const int16_t *src = buf;
+  while (remaining > 0) {
+    int chunk = remaining > chunk_max ? chunk_max : remaining;
+    for (int i = 0; i < chunk; i++) {
+      int32_t v = (int32_t)src[i] << OUTPUT_GAIN_SHIFT;
+      if (v > INT16_MAX) v = INT16_MAX;
+      else if (v < INT16_MIN) v = INT16_MIN;
+      boosted[i] = (int16_t)v;
+    }
+    size_t written = 0;
+    i2s_write(I2S_NUM_0, boosted, chunk * sizeof(int16_t), &written, portMAX_DELAY);
+    src += chunk;
+    remaining -= chunk;
+  }
 }
