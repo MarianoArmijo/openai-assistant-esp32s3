@@ -56,19 +56,27 @@ static void process_message(const char *msg) {
   }
 
   if (strstr(msg, "\"response.done\"")) {
-    // Cool-down lets the DAC drain so we don't echo the assistant's own audio
-    // back through the mic and re-trigger the wake word. Kept just above the
-    // 683 ms DMA output buffer to minimise the gap before next turn.
-    vTaskDelay(pdMS_TO_TICKS(700));
+    // Barge-in: the user already started a new turn (wake word) while we were
+    // still finishing the previous reply. Don't clear their buffered audio
+    // and don't open a follow-up window — they're already streaming.
+    if (oai_assistant_state() == ASSISTANT_STREAMING_TO_OPENAI) {
+      ESP_LOGI(LOG_TAG, "Response done during barge-in — keeping user turn");
+      return;
+    }
+
+    // Cool-down lets the DAC + room reverberation fully die before we open
+    // the mic for follow-up. Too short and the speaker tail re-triggers the
+    // VAD into a feedback loop. 1500 ms = 683 ms DMA buffer + safety margin.
+    vTaskDelay(pdMS_TO_TICKS(1500));
 
     static const char clear_buf[] =
         "{\"type\":\"input_audio_buffer.clear\"}";
     esp_websocket_client_send_text(s_client, clear_buf, strlen(clear_buf),
                                    pdMS_TO_TICKS(500));
 
-    ESP_LOGI(LOG_TAG, "Response done — back to idle (say \"%s\" to activate)",
-             WAKE_WORD_PHRASE);
-    oai_wakeword_set_state(ASSISTANT_IDLE_WAITING_WAKE);
+    ESP_LOGI(LOG_TAG, "Response done — opening follow-up window (%d ms)",
+             FOLLOWUP_WINDOW_MS);
+    oai_wakeword_start_followup_window();
   }
 
   // Log non-audio-delta events (keep audio path quiet)
@@ -200,6 +208,16 @@ static void audio_send_task(void *arg) {
     if (last_state == ASSISTANT_STREAMING_TO_OPENAI &&
         state == ASSISTANT_TTS_PLAYING) {
       commit_and_request_response();
+    }
+    // STREAMING -> IDLE without commit means the follow-up window expired
+    // without speech. Discard buffered audio so it does not pollute the next
+    // turn or get committed accidentally.
+    if (last_state == ASSISTANT_STREAMING_TO_OPENAI &&
+        state == ASSISTANT_IDLE_WAITING_WAKE) {
+      static const char clear_buf[] =
+          "{\"type\":\"input_audio_buffer.clear\"}";
+      esp_websocket_client_send_text(s_client, clear_buf, strlen(clear_buf),
+                                     pdMS_TO_TICKS(500));
     }
     last_state = state;
 

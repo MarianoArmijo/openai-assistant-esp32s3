@@ -17,7 +17,7 @@
 #define DMA_BUF_COUNT_OUT      16
 
 // Software gain applied on output (shift 0 = 1×, 1 = 2× / +6dB, 2 = 4× / +12dB)
-#define OUTPUT_GAIN_SHIFT      2  // ×2 (+6 dB)
+#define OUTPUT_GAIN_SHIFT      1  // ×2 (+6 dB)
 
 // INMP441 input gain: lower shift = more gain.
 // INMP441 outputs 24-bit MSB-aligned in 32-bit. Shift defines int16 mapping:
