@@ -3,12 +3,14 @@
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <mbedtls/base64.h>
+#include <cJSON.h>
 #include <string.h>
 #include <stdlib.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
 #include "main.h"
+#include "memory.h"
 
 // OpenAI Realtime API GA — WebSocket endpoint
 #define OPENAI_WS_URL "wss://api.openai.com/v1/realtime?model=" OPENAI_MODEL
@@ -29,76 +31,95 @@ static volatile bool s_connected = false;     // WebSocket connected
 static volatile bool s_session_ready = false; // session.updated received from server
 static char *s_accum_buf = NULL;
 
-// Vitalservit assistant personality and behaviour (sent once per session).
-#define VITALSERVIT_INSTRUCTIONS \
-    "Eres un asistente virtual de apoyo y acompañamiento para personas mayores de Vitalservit.\\n\\n" \
-    "Tu personalidad es:\\n" \
-    "- cálida,\\n" \
-    "- paciente,\\n" \
-    "- tranquilizadora,\\n" \
-    "- sencilla,\\n" \
-    "- respetuosa,\\n" \
-    "- nunca infantilizante.\\n\\n" \
-    "Hablas como una persona cercana y humana, utilizando frases cortas y fáciles de entender.\\n\\n" \
-    "OBJETIVO PRINCIPAL:\\n" \
-    "Ayudar a la persona mayor a sentirse acompañada, segura y orientada en su día a día.\\n\\n" \
-    "TUS FUNCIONES:\\n" \
-    "- Recordar medicación, comidas, hidratación y citas.\\n" \
-    "- Mantener conversaciones amables y estimulantes.\\n" \
-    "- Detectar señales de tristeza, desorientación, ansiedad o emergencia.\\n" \
-    "- Ayudar con rutinas básicas.\\n" \
-    "- Facilitar contacto con familiares o cuidadores.\\n" \
-    "- Resolver dudas sencillas del día a día.\\n" \
-    "- Motivar hábitos saludables y sociales.\\n" \
-    "- Informar de incidencias relevantes al equipo humano cuando sea necesario.\\n\\n" \
-    "NORMAS IMPORTANTES:\\n" \
-    "- Nunca hables de forma técnica.\\n" \
-    "- Nunca hagas sentir incapaz a la persona.\\n" \
-    "- Nunca discutas.\\n" \
-    "- Nunca generes ansiedad.\\n" \
-    "- Nunca inventes información médica.\\n" \
-    "- Si detectas una posible emergencia, recomienda contactar con el cuidador, familiar o emergencias inmediatamente.\\n" \
-    "- Si detectas confusión grave, caídas, dolor fuerte, dificultad respiratoria o pensamientos depresivos, prioriza pedir ayuda humana.\\n\\n" \
-    "ESTILO:\\n" \
-    "- Usa frases claras y lentas.\\n" \
-    "- Haz una sola pregunta cada vez.\\n" \
-    "- Valida emocionalmente a la persona.\\n" \
-    "- Usa lenguaje natural español de España.\\n" \
-    "- Mantén un tono positivo y calmado.\\n\\n" \
-    "SI LA PERSONA ESTÁ SOLA O TRISTE:\\n" \
-    "- Conversa.\\n" \
-    "- Propón ejercicios mentales suaves.\\n" \
-    "- Pregunta por recuerdos positivos.\\n" \
-    "- Sugiere llamar a familiares.\\n\\n" \
-    "SI LA PERSONA TIENE DIFICULTADES TECNOLÓGICAS:\\n" \
-    "- Explica paso a paso.\\n" \
-    "- Nunca culpes.\\n" \
-    "- Simplifica.\\n\\n" \
-    "SI NO ENTIENDES ALGO:\\n" \
-    "- Pregunta con amabilidad.\\n" \
-    "- Nunca hagas suposiciones peligrosas.\\n\\n" \
-    "ERES PARTE DEL EQUIPO DE VITALSERVIT:\\n" \
-    "Debes transmitir seguridad, cercanía y apoyo humano."
+// Build session.update JSON with Vitalservit prompt + SPIFFS context + input transcription.
+static char *build_session_update_json(void) {
+  char *instructions =
+      (char *)heap_caps_malloc(OAI_INSTRUCTIONS_MAX, MALLOC_CAP_SPIRAM);
+  if (!instructions) {
+    ESP_LOGE(LOG_TAG, "OOM for instructions buffer");
+    return nullptr;
+  }
+  oai_memory_build_instructions(instructions, OAI_INSTRUCTIONS_MAX);
 
-// Session config: client-controlled turn detection (no server VAD), PCM16 in/out.
-// Wake word + local VAD decide when to send audio and when to commit/respond,
-// so that we never burn tokens on ambient audio outside an active turn.
-static const char k_session_update[] =
-    "{\"type\":\"session.update\",\"session\":{"
-    "\"type\":\"realtime\","
-    "\"instructions\":\"" VITALSERVIT_INSTRUCTIONS "\","
-    "\"audio\":{"
-    "\"input\":{"
-    "\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},"
-    "\"turn_detection\":null"
-    "},"
-    "\"output\":{"
-    "\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},"
-    "\"voice\":\"alloy\""
-    "}"
-    "}}}";
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "type", "session.update");
+  cJSON *session = cJSON_CreateObject();
+  cJSON_AddItemToObject(root, "session", session);
+  cJSON_AddStringToObject(session, "type", "realtime");
+  cJSON_AddStringToObject(session, "instructions", instructions);
+  free(instructions);
+
+  cJSON *audio = cJSON_CreateObject();
+  cJSON_AddItemToObject(session, "audio", audio);
+
+  cJSON *input = cJSON_CreateObject();
+  cJSON_AddItemToObject(audio, "input", input);
+  cJSON *in_fmt = cJSON_CreateObject();
+  cJSON_AddItemToObject(input, "format", in_fmt);
+  cJSON_AddStringToObject(in_fmt, "type", "audio/pcm");
+  cJSON_AddNumberToObject(in_fmt, "rate", 24000);
+  cJSON_AddNullToObject(input, "turn_detection");
+  cJSON *transcription = cJSON_CreateObject();
+  cJSON_AddItemToObject(input, "transcription", transcription);
+  cJSON_AddStringToObject(transcription, "model", "gpt-4o-mini-transcribe");
+  cJSON_AddStringToObject(transcription, "language", "es");
+
+  cJSON *output = cJSON_CreateObject();
+  cJSON_AddItemToObject(audio, "output", output);
+  cJSON *out_fmt = cJSON_CreateObject();
+  cJSON_AddItemToObject(output, "format", out_fmt);
+  cJSON_AddStringToObject(out_fmt, "type", "audio/pcm");
+  cJSON_AddNumberToObject(out_fmt, "rate", 24000);
+  cJSON_AddStringToObject(output, "voice", "alloy");
+
+  char *json = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  return json;
+}
+
+static void send_session_update(void) {
+  char *json = build_session_update_json();
+  if (!json) {
+    return;
+  }
+  esp_websocket_client_send_text(s_client, json, strlen(json),
+                                 pdMS_TO_TICKS(5000));
+  ESP_LOGI(LOG_TAG, "session.update sent (%u bytes)", (unsigned)strlen(json));
+  free(json);
+}
+
+static void persist_transcript_events(const char *msg) {
+  cJSON *root = cJSON_Parse(msg);
+  if (!root) {
+    return;
+  }
+
+  cJSON *type_item = cJSON_GetObjectItem(root, "type");
+  if (!cJSON_IsString(type_item)) {
+    cJSON_Delete(root);
+    return;
+  }
+
+  const char *type = type_item->valuestring;
+  if (strcmp(type, "conversation.item.input_audio_transcription.completed") ==
+      0) {
+    cJSON *transcript = cJSON_GetObjectItem(root, "transcript");
+    if (cJSON_IsString(transcript) && transcript->valuestring[0] != '\0') {
+      oai_memory_session_append("user", transcript->valuestring);
+    }
+  } else if (strcmp(type, "response.output_audio_transcript.done") == 0) {
+    cJSON *transcript = cJSON_GetObjectItem(root, "transcript");
+    if (cJSON_IsString(transcript) && transcript->valuestring[0] != '\0') {
+      oai_memory_session_append("assistant", transcript->valuestring);
+    }
+  }
+
+  cJSON_Delete(root);
+}
 
 static void process_message(const char *msg) {
+  persist_transcript_events(msg);
+
   if (strstr(msg, "\"session.updated\"")) {
     s_session_ready = true;
     ESP_LOGI(LOG_TAG, "Session ready — waiting for wake word \"%s\"",
@@ -180,9 +201,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base,
     case WEBSOCKET_EVENT_CONNECTED:
       ESP_LOGI(LOG_TAG, "WebSocket connected to OpenAI Realtime API");
       s_connected = true;
-      esp_websocket_client_send_text(s_client, k_session_update,
-                                     strlen(k_session_update), pdMS_TO_TICKS(2000));
-      ESP_LOGI(LOG_TAG, "session.update sent");
+      send_session_update();
       break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
