@@ -1,22 +1,9 @@
-set(COMMON_SRC "webrtc.cpp" "main.cpp" "http.cpp")
-
 if(IDF_TARGET STREQUAL linux)
-	idf_component_register(
-		SRCS ${COMMON_SRC}
-		REQUIRES peer esp-libopus esp_http_client)
+  idf_component_register(
+    SRCS "main.cpp"
+    REQUIRES esp_event esp_log)
 else()
-	idf_component_register(
-		SRCS ${COMMON_SRC} "wifi.cpp" "media.cpp"
-		REQUIRES driver esp_wifi nvs_flash peer esp_psram esp-libopus esp_http_client)
+  idf_component_register(
+    SRCS "main.cpp" "wifi.cpp" "media.cpp" "websocket.cpp" "wake_word.cpp" "memory.cpp"
+    REQUIRES driver esp_wifi nvs_flash esp_psram esp_websocket_client json mbedtls esp-sr spiffs)
 endif()
-
-idf_component_get_property(lib peer COMPONENT_LIB)
-target_compile_options(${lib} PRIVATE -Wno-error=restrict)
-target_compile_options(${lib} PRIVATE -Wno-error=stringop-truncation)
-
-idf_component_get_property(lib srtp COMPONENT_LIB)
-target_compile_options(${lib} PRIVATE -Wno-error=incompatible-pointer-types)
-
-idf_component_get_property(lib esp-libopus COMPONENT_LIB)
-target_compile_options(${lib} PRIVATE -Wno-error=maybe-uninitialized)
-target_compile_options(${lib} PRIVATE -Wno-error=stringop-overread)
